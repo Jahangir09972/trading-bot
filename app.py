@@ -1,110 +1,152 @@
 # ============================================================
-#  binance_signal.py — Bybit API দিয়ে অটো Crypto Signal
-#  সম্পূর্ণ FREE — কোনো API key লাগবে না
+#  app.py — Main server (Flask)
+#  Run: python app.py
 # ============================================================
 
-import requests
-import time
+from flask import Flask, request, jsonify
 from datetime import datetime
 import pytz
 
-BOT_SERVER = "https://trading-bot-production-09fe.up.railway.app"
-BD_TZ      = pytz.timezone("Asia/Dhaka")
+from config import PORT, SIGNAL_TEMPLATE, RESULT_TEMPLATE
+from market import detect_market, format_direction
+from stats  import record_result, get_today_stats, get_all_today_stats, reset_pair
+from telegram import send_message
 
-PAIRS = [
-    "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT",
-    "DOGEUSDT", "ADAUSDT", "DOTUSDT", "LTCUSDT", "AVAXUSDT",
-]
+app = Flask(__name__)
 
-INTERVAL    = "1"
-EMA_PERIOD  = 20
-CHECK_EVERY = 60
-MIN_CANDLES = 25
+BD_TZ = pytz.timezone("Asia/Dhaka")
 
 
-def get_candles(symbol):
-    url = "https://api.bybit.com/v5/market/kline"
-    params = {"category": "spot", "symbol": symbol, "interval": INTERVAL, "limit": 50}
-    try:
-        resp    = requests.get(url, params=params, timeout=10)
-        data    = resp.json()
-        if data.get("retCode") != 0:
-            print(f"  ⚠️ {symbol}: {data.get('retMsg')}")
-            return [], [], []
-        candles = list(reversed(data["result"]["list"]))
-        if len(candles) < 5:
-            return [], [], []
-        closes = [float(c[4]) for c in candles]
-        highs  = [float(c[2]) for c in candles]
-        lows   = [float(c[3]) for c in candles]
-        return closes, highs, lows
-    except Exception as e:
-        print(f"  ⚠️ {symbol}: {e}")
-        return [], [], []
+def bd_time() -> str:
+    return datetime.now(BD_TZ).strftime("%H:%M  %d-%b-%Y")
 
 
-def calculate_ema(prices, period):
-    if len(prices) < period:
-        return []
-    k, ema = 2 / (period + 1), [sum(prices[:period]) / period]
-    for p in prices[period:]:
-        ema.append(p * k + ema[-1] * (1 - k))
-    return ema
+# ─────────────────────────────────────────────────────────────
+#  POST /signal
+#  TradingView webhook এখানে আসবে
+#  Body (JSON):
+#  {
+#    "pair":       "AUDJPY",
+#    "direction":  "PUT",          ← PUT or CALL
+#    "entry":      "113.510",
+#    "timeframe":  "M1",
+#    "resistance": "113.696",      ← optional
+#    "support":    "113.158",      ← optional
+#    "trend":      "DOWN"          ← optional
+#  }
+# ─────────────────────────────────────────────────────────────
+@app.route("/signal", methods=["POST"])
+def signal():
+    d = request.json or {}
+
+    pair      = d.get("pair",       "UNKNOWN").upper()
+    direction = d.get("direction",  "PUT").upper()
+    entry     = d.get("entry",      "N/A")
+    timeframe = d.get("timeframe",  "M1")
+    resistance= d.get("resistance", "N/A")
+    support   = d.get("support",    "N/A")
+    trend     = d.get("trend",      "N/A")
+
+    market = detect_market(pair)
+    stats  = get_today_stats(pair)
+
+    msg = SIGNAL_TEMPLATE.format(
+        market_icon  = market["icon"],
+        pair         = pair,
+        category     = market["label"],
+        direction_icon = format_direction(direction),
+        timeframe    = timeframe,
+        entry        = entry,
+        time         = bd_time(),
+        resistance   = resistance,
+        support      = support,
+        trend        = trend,
+        win          = stats["win"],
+        loss         = stats["loss"],
+        winrate      = stats["winrate"]
+    )
+
+    ok = send_message(msg)
+    return jsonify({"status": "sent" if ok else "failed", "pair": pair})
 
 
-def detect_signal(closes, highs, lows):
-    ema = calculate_ema(closes, EMA_PERIOD)
-    if len(ema) < 2:
-        return None
-    resistance = round(max(highs[-20:]), 6)
-    support    = round(min(lows[-20:]),  6)
-    if closes[-2] <= ema[-2] and closes[-1] > ema[-1]:
-        return {"direction": "CALL", "entry": round(closes[-1], 6), "resistance": resistance, "support": support, "trend": "UP"}
-    if closes[-2] >= ema[-2] and closes[-1] < ema[-1]:
-        return {"direction": "PUT",  "entry": round(closes[-1], 6), "resistance": resistance, "support": support, "trend": "DOWN"}
-    return None
+# ─────────────────────────────────────────────────────────────
+#  POST /result
+#  Signal শেষ হলে WIN/LOSS পাঠান
+#  Body: { "pair": "AUDJPY", "outcome": "WIN" }
+# ─────────────────────────────────────────────────────────────
+@app.route("/result", methods=["POST"])
+def result():
+    d       = request.json or {}
+    pair    = d.get("pair",    "UNKNOWN").upper()
+    outcome = d.get("outcome", "LOSS").upper()
+
+    record_result(pair, outcome)
+    stats = get_today_stats(pair)
+
+    icon = "🏆" if outcome == "WIN" else "❌"
+    msg  = RESULT_TEMPLATE.format(
+        result_icon = icon,
+        pair        = pair,
+        win         = stats["win"],
+        loss        = stats["loss"],
+        winrate     = stats["winrate"]
+    )
+
+    ok = send_message(msg)
+    return jsonify({"status": "ok", "stats": stats})
 
 
-def send_signal(pair, signal):
-    try:
-        requests.post(f"{BOT_SERVER}/signal", json={
-            "pair": pair, "direction": signal["direction"],
-            "entry": str(signal["entry"]), "timeframe": f"M{INTERVAL}",
-            "resistance": str(signal["resistance"]), "support": str(signal["support"]),
-            "trend": signal["trend"]
-        }, timeout=10)
-        t = datetime.now(BD_TZ).strftime("%H:%M:%S")
-        print(f"  ✅ [{t}] {pair} {signal['direction']} @ {signal['entry']}")
-    except Exception as e:
-        print(f"  ❌ {pair}: {e}")
+# ─────────────────────────────────────────────────────────────
+#  GET /summary
+#  সব pair-এর আজকের summary
+# ─────────────────────────────────────────────────────────────
+@app.route("/summary", methods=["GET"])
+def summary():
+    all_stats = get_all_today_stats()
+
+    if not all_stats:
+        send_message("📊 *Today Summary*\nআজ কোনো signal নেই।")
+        return jsonify({"status": "empty"})
+
+    lines = ["📊 *TODAY FULL SUMMARY*\n━━━━━━━━━━━━━━━━━━"]
+    for pair, s in all_stats.items():
+        market = detect_market(pair)
+        lines.append(
+            f"{market['icon']} *{pair}* — ✅{s['win']} ❌{s['loss']} ({s['winrate']}%)"
+        )
+    lines.append("━━━━━━━━━━━━━━━━━━")
+    send_message("\n".join(lines))
+    return jsonify(all_stats)
 
 
-def main():
-    print("=" * 55)
-    print("🚀 Bybit Auto Signal Bot Started!")
-    print(f"📊 Pairs: {', '.join(PAIRS)}")
-    print(f"⏱ Interval: M{INTERVAL} | Check: {CHECK_EVERY}s")
-    print(f"🌐 Server: {BOT_SERVER}")
-    print("=" * 55)
-    last = {p: None for p in PAIRS}
-    while True:
-        t = datetime.now(BD_TZ).strftime("%H:%M:%S")
-        print(f"\n[{t}] Checking {len(PAIRS)} pairs...")
-        for pair in PAIRS:
-            closes, highs, lows = get_candles(pair)
-            if len(closes) < MIN_CANDLES:
-                continue
-            signal = detect_signal(closes, highs, lows)
-            if signal:
-                if last[pair] != signal["direction"]:
-                    send_signal(pair, signal)
-                    last[pair] = signal["direction"]
-            else:
-                print(f"  ➖ {pair}: No signal")
-            time.sleep(0.3)
-        print(f"⏳ Next check in {CHECK_EVERY}s...")
-        time.sleep(CHECK_EVERY)
+# ─────────────────────────────────────────────────────────────
+#  POST /reset
+#  একটি pair reset: { "pair": "AUDJPY" }
+# ─────────────────────────────────────────────────────────────
+@app.route("/reset", methods=["POST"])
+def reset():
+    pair = (request.json or {}).get("pair", "").upper()
+    reset_pair(pair)
+    return jsonify({"status": "reset", "pair": pair})
 
+
+# ─────────────────────────────────────────────────────────────
+#  GET /health  — server চলছে কিনা দেখুন
+# ─────────────────────────────────────────────────────────────
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"status": "running", "time": bd_time()})
+
+import threading
+from binance_signal import main as binance_main
+
+def start_binance():
+    binance_main()
+
+thread = threading.Thread(target=start_binance, daemon=True)
+thread.start()
 
 if __name__ == "__main__":
-    main()
+    print(f"✅ Bot server running on port {PORT}")
+    app.run(host="0.0.0.0", port=PORT)
