@@ -138,6 +138,14 @@ def reset():
 def health():
     return jsonify({"status": "running", "time": bd_time()})
 
+import threading
+from binance_signal import main as binance_main
+
+def start_binance():
+    binance_main()
+
+thread = threading.Thread(target=start_binance, daemon=True)
+thread.start()
 
 if __name__ == "__main__":
     print(f"✅ Bot server running on port {PORT}")
